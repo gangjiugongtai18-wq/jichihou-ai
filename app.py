@@ -116,7 +116,7 @@ if st.button("AIに質問する"):
 
         with st.spinner("AIが回答を作成しています..."):
             response = client.chat.completions.create(
-                model="gemini-2.5-flash",
+               model="gemini-3.5-flash-lite", 
                 messages=[
                     {
                         "role": "system",
