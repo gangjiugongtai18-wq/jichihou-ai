@@ -1,16 +1,15 @@
+import datetime as dt
 import json
 import re
-import datetime as dt
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 
 import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="自治法AI Ver.6", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.6｜地方自治法・施行令・施行規則")
-st.caption("e-Govの施行中本文を根拠に検索。未施行改正と委任関係は確認できた範囲だけ表示します。")
+st.set_page_config(page_title="自治法AI Ver.7", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7｜国の法令と自治体例規の確認事項")
+st.caption("e-Govの法令原文を確認し、自治体の条例・規則等で別途確認すべき事項を表示します。")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -19,359 +18,395 @@ LAWS = {
 }
 API1 = "https://laws.e-gov.go.jp/api/1/lawdata/"
 API2 = "https://laws.e-gov.go.jp/api/2/law_revisions/"
-MODEL = "gemini-3.5-flash-lite"  # 利用中のモデル名。接続できない場合は有効なモデルに変更
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
-KANJI_NUMS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
-              "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20}
+LOCAL_PATTERNS = [
+    (r"(?:普通地方公共団体|地方公共団体|当該団体|当該普通地方公共団体)?の?条例(?:で|により|の定めるところ)", "条例"),
+    (r"(?:普通地方公共団体|地方公共団体|当該団体|当該普通地方公共団体)の規則(?:で|により|の定めるところ)", "自治体の規則"),
+    (r"(?:議会の)?会議規則(?:で|により|の定めるところ)", "議会の会議規則"),
+    (r"(?:普通地方公共団体の)?長が(?:別に)?定める", "長が定める規程等"),
+    (r"(?:条例|規則)の定めるところ", "条例・規則"),
+]
+# 「規則で定める」だけでは国の省令を指す場合もあるため、自治体の規則と即断しない。
+AMBIGUOUS_PATTERN = r"(?<!省令)(?<!総務省令)規則で定める"
+NATIONAL_REF_PATTERN = re.compile(r"([一-龥ぁ-んァ-ヶ・]{2,55}(?:法律|法|政令|省令|施行令|施行規則))第[一二三四五六七八九十百千〇零０-９0-9の]+条")
 
 
-def number(value):
-    s = str(value or "").translate(DIGITS).strip().replace("条", "").replace("第", "")
+def normalize_num(value):
+    s = str(value or "").translate(DIGITS).strip().replace("第", "").replace("条", "")
     s = s.replace("の", "_").replace("-", "_")
     return s if re.fullmatch(r"\d+(?:_\d+)*", s) else ""
 
 
-def label(num):
-    return "第" + num.replace("_", "条の", 1) + ("" if "_" in num else "条")
+def article_label(num):
+    parts = num.split("_")
+    return "第" + parts[0] + "条" + "".join("の" + x for x in parts[1:])
 
 
-def content(node):
+def node_text(node):
     return "".join(node.itertext()).strip() if node is not None else ""
 
 
-def item_label_to_number(s):
-    s = str(s).replace("第", "").replace("号", "").strip().translate(DIGITS)
-    if s.isdigit():
-        return int(s)
-    return KANJI_NUMS.get(s)
+def parse_article(article):
+    paragraphs = []
+    for p in article.findall("./Paragraph"):
+        pnum = str(p.get("Num") or len(paragraphs) + 1)
+        sentence = node_text(p.find("./ParagraphSentence"))
+        items = []
+        for item in p.findall("./Item"):
+            item_num = str(item.get("Num") or "").translate(DIGITS)
+            item_num = item_num.replace("第", "").replace("号", "")
+            # 号の内部の細目も、少なくとも本文として保存する。
+            item_text = node_text(item.find("./ItemSentence"))
+            subitems = [node_text(x) for x in item if x.tag not in ("ItemTitle", "ItemSentence")]
+            item_text += " " + " ".join(x for x in subitems if x)
+            if item_text.strip():
+                items.append({"num": item_num, "text": item_text.strip()})
+        if sentence or items:
+            paragraphs.append({"num": pnum, "text": sentence, "items": items})
+    return paragraphs
+
+
+def render_article(name, num, art, paragraph=None, item=None):
+    lines = [f"【{name} {article_label(num)}】"]
+    for p in art["paragraphs"]:
+        if paragraph and p["num"] != str(paragraph):
+            continue
+        lines.append(f"第{p['num']}項 {p['text']}")
+        for it in p["items"]:
+            if item and it["num"] != str(item):
+                continue
+            lines.append(f"  第{it['num']}号 {it['text']}")
+    return "\n".join(lines)
 
 
 @st.cache_data(ttl=43200, show_spinner=False)
-def get_law(kind):
-    name, law_id = LAWS[kind]
-    response = requests.get(API1 + law_id, timeout=50)
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
-    articles = {}
-    # 附則の同番号条文と混同しないよう本則の条文だけを優先
+def fetch_law(law_id):
+    res = requests.get(API1 + law_id, timeout=55)
+    res.raise_for_status()
+    root = ET.fromstring(res.content)
     main = root.find(".//MainProvision")
     if main is None:
-        raise ValueError(f"{name}: 本則のXMLを解析できません")
-    for article in main.findall(".//Article"):
-        num = number(article.get("Num"))
+        raise ValueError(f"法令ID {law_id} の本則を取得できません")
+    articles = {}
+    for node in main.findall(".//Article"):
+        num = normalize_num(node.get("Num"))
         if not num or num in articles:
             continue
-        paragraphs = []
-        for p in article.findall("./Paragraph"):
-            pnum = str(p.get("Num") or len(paragraphs) + 1)
-            sentence = content(p.find("ParagraphSentence"))
-            items = []
-            for item in p.findall("./Item"):
-                item_num = item_label_to_number(item.get("Num") or content(item.find("ItemTitle")))
-                item_text = content(item.find("ItemSentence"))
-                if item_text:
-                    items.append({"num": item_num, "text": item_text})
-            if sentence or items:
-                paragraphs.append({"num": pnum, "text": sentence, "items": items})
+        paragraphs = parse_article(node)
         if paragraphs:
             plain = "\n".join(
-                f"第{p['num']}項 {p['text']} " + " ".join(f"第{x['num']}号 {x['text']}" for x in p['items'])
+                p["text"] + " " + " ".join(i["text"] for i in p["items"])
                 for p in paragraphs
             )
-            articles[num] = {"num": num, "paragraphs": paragraphs, "text": plain}
+            articles[num] = {"paragraphs": paragraphs, "text": plain}
     if not articles:
-        raise ValueError(f"{name}: 条文が取得できませんでした")
+        raise ValueError(f"法令ID {law_id} の条文が見つかりません")
     return articles
 
 
 @st.cache_data(ttl=43200, show_spinner=False)
-def revision_status(kind):
-    """法令単位の未施行履歴。条項単位の施行判定には流用しない。"""
-    law_id = LAWS[kind][1]
+def revision_status(law_id):
     try:
-        res = requests.get(API2 + law_id, timeout=18, headers={"Accept": "application/json"})
-        res.raise_for_status()
-        data = res.json()
-        today = dt.date.today()
-        found = []
+        r = requests.get(API2 + law_id, timeout=20, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        data = r.json()
+        future = []
 
         def walk(obj):
             if isinstance(obj, dict):
-                # APIの履歴情報に明示された施行日だけを抽出する
                 for key in ("enforcement_date", "enforcementDate"):
-                    val = obj.get(key)
-                    if isinstance(val, str):
-                        m = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})", val)
+                    v = obj.get(key)
+                    if isinstance(v, str):
+                        m = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})", v)
                         if m:
                             try:
-                                day = dt.date(*map(int, m.groups()))
-                                if day > today:
-                                    found.append(day.isoformat())
+                                d = dt.date(*map(int, m.groups()))
+                                if d > dt.date.today():
+                                    future.append(d.isoformat())
                             except ValueError:
                                 pass
-                for v in obj.values():
-                    walk(v)
+                for value in obj.values():
+                    walk(value)
             elif isinstance(obj, list):
-                for v in obj:
-                    walk(v)
+                for value in obj:
+                    walk(value)
+
         walk(data)
-        return sorted(set(found)), "取得済み"
+        return sorted(set(future)), True
     except Exception:
-        return [], "取得不可"
+        return [], False
 
 
-def ai_client():
+def client_for_gemini():
     key = st.secrets.get("GEMINI_API_KEY", "")
     if not key:
-        raise RuntimeError("Streamlit SecretsにGEMINI_API_KEYを登録してください")
+        raise RuntimeError("Streamlit SecretsにGEMINI_API_KEYが設定されていません")
     return OpenAI(api_key=key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
 
 
-def ask(client, system, user, limit=1600):
-    resp = client.chat.completions.create(
-        model=MODEL, temperature=0, max_tokens=limit,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+def ai_json(client, model, system, message, max_tokens=1800):
+    r = client.chat.completions.create(
+        model=model, temperature=0, max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": message}],
     )
-    return (resp.choices[0].message.content or "").strip()
-
-
-def as_json(raw):
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+    raw = (r.choices[0].message.content or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         a, b = raw.find("{"), raw.rfind("}")
         if a < 0 or b < a:
-            raise ValueError("AIの応答をJSONとして解析できません")
+            raise ValueError("AIのJSON応答を解析できません")
         return json.loads(raw[a:b + 1])
 
 
-def explicit_refs(question):
+def explicit_refs(question, law_names):
     q = question.translate(DIGITS)
-    result = []
-    # 第3項だけを「第3条」と誤認しないよう、必ず「条」を要求
     pat = r"第\s*(\d+(?:の\d+)?)\s*条(?:\s*第\s*(\d+)\s*項)?(?:\s*第\s*(\d+)\s*号)?"
+    result = []
     for m in re.finditer(pat, q):
-        before = q[max(0, m.start() - 25):m.start()]
-        kind = "規則" if "施行規則" in before else "令" if "施行令" in before else "法"
-        result.append({"kind": kind, "article": number(m.group(1)),
-                       "paragraph": m.group(2), "item": m.group(3)})
+        before = q[max(0, m.start() - 55):m.start()]
+        hits = [(len(name), k) for k, (name, _) in law_names.items() if name in before]
+        kind = max(hits)[1] if hits else "法"
+        result.append({"kind": kind, "article": normalize_num(m.group(1)),
+                       "paragraph": m.group(2) or "", "item": m.group(3) or ""})
     return result
 
 
-def search_articles(question, corpus, limit=12):
-    # 検索分析は候補作成専用。法的結論はAIに検索時点で書かせない
-    keywords = re.findall(r"[一-龥ぁ-んァ-ヶ]{2,8}", question)
-    keywords += [x for x in ("専決", "議会", "副市長", "条例", "予算", "出張", "承認", "代理") if x in question]
-    scored = []
-    for kind, articles in corpus.items():
-        for num, art in articles.items():
-            score = sum(min(3, art["text"].count(w)) for w in set(keywords) if len(w) >= 2)
-            if score:
-                scored.append((score, kind, num))
-    scored.sort(reverse=True)
-    return [{"kind": k, "article": n} for _, k, n in scored[:limit]]
-
-
-def candidate_refs(question, corpus, client):
-    explicit = explicit_refs(question)
-    system = """あなたは法令検索の候補抽出器です。法的結論を出してはいけません。
-地方自治法・地方自治法施行令・地方自治法施行規則の候補条番号をJSONのみで返す。
-形式: {"candidates":[{"kind":"法","article":"179"}],"keywords":["専決処分"]}
-kindは法/令/規則のみ。条番号は数字、枝番号は179_2の形式。第3項を第3条と解釈しない。
-確信がない候補は出さない。"""
+def find_candidates(question, corpus, names, client, model):
+    explicit = explicit_refs(question, names)
+    system = """あなたは法令検索用の条番号候補抽出器です。法的結論は出さないでください。
+JSONのみ: {"candidates":[{"kind":"法","article":"234"}]}
+kindは入力で示す識別子のみ。条番号は半角数字、枝番号は167_2形式。
+確信のない条番号を捏造しない。"""
     try:
-        result = as_json(ask(client, system, question, 900))
-        ai_refs = result.get("candidates", [])
+        ai = ai_json(client, model, system, "法令識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items()) + "\n質問: " + question, 900)
+        ai_refs = ai.get("candidates", [])
     except Exception:
         ai_refs = []
-    merged, seen = [], set()
-    for x in explicit + ai_refs + search_articles(question, corpus):
+    words = set(re.findall(r"[一-龥ぁ-んァ-ヶ]{2,7}", question))
+    words |= {w for w in ("専決", "承認", "随意契約", "入札", "条例", "議会", "副市長", "代理", "契約") if w in question}
+    ranked = []
+    for kind, articles in corpus.items():
+        for num, art in articles.items():
+            score = sum(min(3, art["text"].count(w)) for w in words if len(w) > 1)
+            if score:
+                ranked.append((score, kind, num))
+    ranked.sort(key=lambda x: -x[0])
+    refs, seen = [], set()
+    for x in explicit + ai_refs + [{"kind": k, "article": n} for _, k, n in ranked[:12]]:
         if not isinstance(x, dict):
             continue
-        k, n = x.get("kind"), number(x.get("article"))
+        k, n = x.get("kind"), normalize_num(x.get("article"))
         if k not in corpus or n not in corpus[k] or (k, n) in seen:
             continue
         seen.add((k, n))
-        merged.append({"kind": k, "article": n})
-        if len(merged) >= 14:
+        refs.append({"kind": k, "article": n})
+        if len(refs) >= 10:
             break
-    return merged, explicit
+    return refs, explicit
 
 
-def paragraph_view(kind, num, art, only_paragraph=None, only_item=None):
-    lines = [f"【{LAWS[kind][0]} {label(num)}】"]
-    for p in art["paragraphs"]:
-        if only_paragraph and p["num"] != str(only_paragraph):
-            continue
-        lines.append(f"第{p['num']}項 {p['text']}")
-        for item in p["items"]:
-            if only_item and item["num"] != int(only_item):
-                continue
-            lines.append(f"  第{item['num']}号 {item['text']}")
-    return "\n".join(lines)
+def local_checks(refs, corpus, names):
+    checks, seen = [], set()
+    for ref in refs:
+        k, n = ref["kind"], ref["article"]
+        art = corpus[k][n]
+        for p in art["paragraphs"]:
+            chunks = [(p["text"], f"第{p['num']}項")]
+            chunks += [(it["text"], f"第{p['num']}項第{it['num']}号") for it in p["items"]]
+            for body, loc in chunks:
+                kinds = [name for pattern, name in LOCAL_PATTERNS if re.search(pattern, body)]
+                if not kinds and re.search(AMBIGUOUS_PATTERN, body):
+                    kinds = ["規則（制定主体の確認が必要）"]
+                for name in set(kinds):
+                    key = (k, n, loc, name)
+                    if key not in seen:
+                        seen.add(key)
+                        checks.append({"source": f"{names[k][0]} {article_label(n)}{loc}",
+                                       "type": name, "excerpt": body[:230]})
+    return checks
 
 
-def related_provisions(selected, corpus):
-    """下位法令に親法令の条番号が明記される場合だけ候補として提示。委任確定はしない。"""
-    results = []
-    for ref in selected:
-        kind, num = ref["kind"], ref["article"]
-        if kind == "規則":
-            continue
-        target = "令" if kind == "法" else "規則"
-        # 法律条文の引用「第百七十九条」等の漢数字もあるため、AIに確定判定させず候補のみ
-        numeral = num.split("_")[0]
-        expressions = [f"第{numeral}条", f"第{numeral}條"]
-        for target_num, art in corpus.get(target, {}).items():
-            if any(x in art["text"] for x in expressions):
-                results.append({"kind": target, "article": target_num,
-                                "source": f"{LAWS[kind][0]} {label(num)} の番号への言及候補"})
-            if len(results) >= 6:
-                return results
-    return results
+def national_mentions(refs, corpus, names):
+    results = set()
+    for ref in refs:
+        body = corpus[ref["kind"]][ref["article"]]["text"]
+        for m in NATIONAL_REF_PATTERN.finditer(body):
+            candidate = m.group(0)
+            if len(candidate) < 85:
+                results.add(candidate)
+    return sorted(results)[:12]
 
 
-def critical_errors(question, answer, refs):
-    text = " ".join(str(answer.get(k, "")) for k in ("conclusion", "explanation", "conditions", "cautions"))
-    problems = []
-    if any(r["kind"] == "法" and r["article"] == "179" for r in refs):
-        if re.search(r"承認を(?:必ず)?得なければならな|承認を得る必要があ|承認を受けなければならな", text):
-            problems.append("第179条第3項は『承認を求めなければならない』と規定しています。『得なければならない』への置換を検出しました。")
-    if "出張" in question and re.search(r"必ず.{0,12}(代理|副市長)|出張.{0,12}当然.{0,12}代理", text):
-        problems.append("出張だけで当然に職務代理になると断定しています。")
-    return problems
-
-
-def answer_question(question, selected, corpus, client, explicit):
-    passages = []
-    for ref in selected[:7]:
-        kind, num = ref["kind"], ref["article"]
-        matching = next((r for r in explicit if r["kind"] == kind and r["article"] == num), None)
-        # 指定条項があればその項を優先。ただし他項も必要な質問ではAIに不足を明示させる
-        passages.append(paragraph_view(kind, num, corpus[kind][num],
-                                       matching.get("paragraph") if matching else None,
-                                       matching.get("item") if matching else None)[:9000])
-    evidence = "\n\n".join(passages)[:26000]
-    system = """あなたは日本の地方自治法に関する厳格な法令説明者です。提供したe-Gov本文だけを根拠に回答してください。
-・義務「求めなければならない」と結果「得なければならない」を絶対に混同しない。
-・「できる」「しなければならない」「してはならない」を意味が変わる形で言い換えない。
-・質問に「必ず」があれば、条件を確認して最初に「はい」「いいえ」「一概にはいえません」で答える。
-・未施行の法令内容、判例、通達、委任関係は本文から確定できなければ断定しない。
-・引用する根拠は提供した条文の条・項・号のみ。確認できない事項は確認できないと書く。
-・法令に規定のない事実や手続きを補わない。
-JSONのみを返す。形式:
-{"conclusion":"...","explanation":"...","conditions":["..."],"cautions":["..."],
-"citations":[{"kind":"法","article":"179","paragraph":"3","item":null}]}
-引用のkindは法/令/規則。根拠として直接使用したものだけを列挙。"""
-    raw = ask(client, system, f"質問：{question}\n\n確認済み条文：\n{evidence}", 2300)
-    answer = as_json(raw)
+def generate_answer(question, refs, corpus, names, client, model, explicit):
+    evidence = []
+    for ref in refs[:7]:
+        k, n = ref["kind"], ref["article"]
+        evidence.append(render_article(names[k][0], n, corpus[k][n])[:11500])
+    system = """あなたは地方自治法等を説明する法令検索AIです。提示されたe-Gov原文のみを根拠に答える。
+法律上の『承認を求める』と『承認を得る』を混同しない。
+第167条（指名競争入札）と第167条の2（随意契約）を混同しない。
+第167条の2第1項第1号の金額基準を第5号などに一律適用しない。
+条例・自治体規則・会議規則・長の定め等に委ねられる事項は、その具体的内容を断定しない。
+引用先の他の国の法律・政令・省令の本文が提示されていなければ、その内容を確認済みとしない。
+未施行改正・判例・通知・自治体例規を推測で補わない。
+引用は提示した法令識別子・条番号に限定し、実際に根拠として使った条文だけを挙げる。
+JSONのみで回答する。形式:
+{"conclusion":"...","explanation":"...","conditions":["..."],"cautions":["..."],"citations":[{"kind":"令","article":"167_2","paragraph":"1","item":"5"}]}"""
+    prompt = "識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items())
+    prompt += "\n質問: " + question + "\n\n確認済み条文:\n" + "\n\n".join(evidence)[:36000]
+    answer = ai_json(client, model, system, prompt, 2600)
     if not isinstance(answer, dict):
-        raise ValueError("回答形式が不正です")
+        raise ValueError("回答の形式が不正です")
     citations = []
-    for x in answer.get("citations", []):
-        if not isinstance(x, dict):
+    for c in answer.get("citations", []):
+        if not isinstance(c, dict):
             continue
-        k, n = x.get("kind"), number(x.get("article"))
-        if k not in corpus or n not in corpus[k] or not any(r["kind"] == k and r["article"] == n for r in selected[:7]):
+        k, n = c.get("kind"), normalize_num(c.get("article"))
+        if not any(r["kind"] == k and r["article"] == n for r in refs[:7]):
             continue
-        p = str(x.get("paragraph") or "")
-        if p and p not in {a["num"] for a in corpus[k][n]["paragraphs"]}:
+        art = corpus[k][n]
+        p = str(c.get("paragraph") or "")
+        item = str(c.get("item") or "")
+        if p and p not in {x["num"] for x in art["paragraphs"]}:
             continue
-        citations.append({"kind": k, "article": n, "paragraph": p, "item": x.get("item")})
+        if item and not any(i["num"] == item for x in art["paragraphs"] if not p or x["num"] == p for i in x["items"]):
+            continue
+        citation = {"kind": k, "article": n, "paragraph": p, "item": item}
+        if citation not in citations:
+            citations.append(citation)
     answer["citations"] = citations
-    errors = critical_errors(question, answer, selected[:7])
+    errors = []
+    text = " ".join(str(answer.get(x, "")) for x in ("conclusion", "explanation", "conditions", "cautions"))
     if not citations:
-        errors.append("有効な根拠条文の引用を確認できませんでした。")
+        errors.append("回答の根拠条文を検証できませんでした。")
+    if any(c["kind"] == "法" and c["article"] == "179" for c in citations):
+        if re.search(r"承認を(?:必ず)?得なければならな|承認を得る必要があ|承認を受けなければならな", text):
+            errors.append("第179条の『承認を求める』と『承認を得る』の混同を検出しました。")
+    if "出張" in question and re.search(r"必ず.{0,12}(代理|副市長)|出張.{0,12}当然.{0,12}代理", text):
+        errors.append("出張のみを理由とする当然の職務代理という断定を検出しました。")
     return answer, errors
 
 
 with st.sidebar:
     st.header("検索設定")
-    kinds = st.multiselect("検索する法令", list(LAWS), default=list(LAWS),
-                           format_func=lambda k: LAWS[k][0])
-    st.caption("本文はe-Gov API Version 1の施行中法令を取得します。")
-    st.caption("未施行の改正履歴はVersion 2で法令単位に確認します。条項単位の判定ではありません。")
-    st.markdown("[e-Gov 法令API Version 2](https://laws.e-gov.go.jp/api/2/swagger-ui/)")
+    chosen = st.multiselect("検索する基本法令", list(LAWS), default=list(LAWS),
+                            format_func=lambda k: LAWS[k][0])
+    st.caption("自治体の条例・規則等は取得しません。確認が必要な場合に注意を表示します。")
+    st.markdown("[e-Gov法令API](https://laws.e-gov.go.jp/api/)")
+    with st.expander("他の国の法令を追加（任意）"):
+        other_name = st.text_input("法令名", placeholder="例：行政手続法")
+        other_id = st.text_input("e-Gov法令ID", placeholder="例：405AC0000000088")
+        st.caption("法令名だけで自動特定はしません。正しい法令IDをe-Govで確認して入力してください。")
+    model = st.text_input("Geminiモデル", value=DEFAULT_MODEL)
 
-question = st.text_area("地方自治法について質問してください", placeholder="例：地方自治法第179条第3項には何が書かれていますか？", height=95)
-run = st.button("条文を検索して回答", type="primary", disabled=not kinds)
+question = st.text_area("地方自治法等について質問してください", height=110,
+                        placeholder="例：少額随意契約の金額基準は自治体の規則で定めますか？")
+run = st.button("条文を検索して回答", type="primary", disabled=not chosen and not other_id.strip())
 
 if run:
     if not question.strip():
         st.warning("質問を入力してください。")
         st.stop()
-    try:
-        with st.spinner("e-Govの3法令を取得しています..."):
-            corpus = {k: get_law(k) for k in kinds}
-        with st.spinner("条文を検索・照合しています..."):
-            client = ai_client()
-            selected, explicit = candidate_refs(question, corpus, client)
-        if not selected:
-            st.warning("根拠となる条文を特定できませんでした。質問を具体的にしてください。")
+    names = {k: LAWS[k] for k in chosen}
+    if other_id.strip() or other_name.strip():
+        if not (other_id.strip() and other_name.strip()):
+            st.error("追加法令は法令名と法令IDを両方入力してください。")
             st.stop()
-
+        if not re.fullmatch(r"[0-9A-Z]{15}", other_id.strip().upper()):
+            st.error("法令IDの形式を確認してください（英数字15文字）。")
+            st.stop()
+        names["追加"] = (other_name.strip(), other_id.strip().upper())
+    try:
+        with st.spinner("e-Govから法令原文を取得しています..."):
+            corpus = {k: fetch_law(law_id) for k, (_, law_id) in names.items()}
+        client = client_for_gemini()
+        with st.spinner("根拠条文を検索しています..."):
+            refs, explicit = find_candidates(question, corpus, names, client, model)
+        if not refs:
+            st.warning("根拠条文を特定できませんでした。改正履歴など、条文検索以外の質問には対応できない場合があります。")
+            st.stop()
         st.subheader("条文検索結果")
-        st.write("、".join(f"{LAWS[r['kind']][0]} {label(r['article'])}" for r in selected[:7]))
+        st.write("、".join(f"{names[r['kind']][0]} {article_label(r['article'])}" for r in refs[:7]))
         with st.spinner("根拠条文から回答を作成しています..."):
-            answer, errors = answer_question(question, selected, corpus, client, explicit)
+            answer, errors = generate_answer(question, refs, corpus, names, client, model, explicit)
 
         st.subheader("AIの回答")
         if errors:
-            st.error("法律表現または根拠の検証で問題を検出しました。AIの解釈文は表示せず、下の条文原文を確認してください。")
+            st.error("回答の検証で問題を検出しました。解釈文は表示せず、根拠原文を確認してください。")
             for e in errors:
                 st.write("・" + e)
         else:
             st.markdown("**結論**")
-            st.write(answer.get("conclusion", ""))
+            st.write(str(answer.get("conclusion", "")))
             st.markdown("**説明**")
-            st.write(answer.get("explanation", ""))
-            for heading, key in (("適用条件", "conditions"), ("注意点", "cautions")):
-                vals = answer.get(key, [])
-                if isinstance(vals, list) and vals:
-                    st.markdown(f"**{heading}**")
-                    for v in vals:
+            st.write(str(answer.get("explanation", "")))
+            for title, key in (("適用条件", "conditions"), ("注意点", "cautions")):
+                values = answer.get(key, [])
+                if isinstance(values, list) and values:
+                    st.markdown(f"**{title}**")
+                    for v in values:
                         st.write("・" + str(v))
+        if answer["citations"]:
             st.markdown("**回答に用いた根拠条文**")
             for c in answer["citations"]:
-                suffix = f"第{c['paragraph']}項" if c["paragraph"] else ""
-                if c["item"]:
-                    suffix += f"第{c['item']}号"
-                st.write(f"・{LAWS[c['kind']][0]} {label(c['article'])}{suffix}")
+                suffix = (f"第{c['paragraph']}項" if c["paragraph"] else "") + (f"第{c['item']}号" if c["item"] else "")
+                st.write(f"・{names[c['kind']][0]} {article_label(c['article'])}{suffix}")
 
-        st.subheader("e-Govから取得した条文原文")
-        st.caption("AIによる書換えではありません。第1項・第2項などの構造を保持しています。")
-        for i, r in enumerate(selected[:7]):
-            kind, num = r["kind"], r["article"]
-            name, law_id = LAWS[kind]
-            with st.expander(f"{name} {label(num)}", expanded=(i == 0)):
-                match = next((x for x in explicit if x["kind"] == kind and x["article"] == num), None)
-                st.text(paragraph_view(kind, num, corpus[kind][num],
-                                       match.get("paragraph") if match else None,
-                                       match.get("item") if match else None))
-                st.link_button("e-Govで法令を確認", f"https://laws.e-gov.go.jp/law/{law_id}")
+        # 引用された条文を最優先に表示する。AI回答が抑止されても原文は表示する。
+        st.subheader("e-Govから取得した根拠条文原文")
+        st.caption("AIの言い換えではなくe-Gov XML由来の本文です。附則や別表はこの版では対象外です。")
+        priority = []
+        for c in answer["citations"]:
+            key = (c["kind"], c["article"])
+            if key not in priority:
+                priority.append(key)
+        for r in refs[:7]:
+            key = (r["kind"], r["article"])
+            if key not in priority:
+                priority.append(key)
+        for index, (k, n) in enumerate(priority):
+            citation = next((c for c in answer["citations"] if c["kind"] == k and c["article"] == n), None)
+            heading = f"{names[k][0]} {article_label(n)}"
+            with st.expander(heading, expanded=(index == 0 or (citation is not None and index < 3))):
+                st.text(render_article(names[k][0], n, corpus[k][n]))
+                st.link_button("e-Govで法令を確認", f"https://laws.e-gov.go.jp/law/{names[k][1]}")
 
-        st.subheader("施行状況")
-        st.info("上の本文はe-Gov API Version 1から取得した施行中本文です。未施行改正後の条文は混在させていません。")
-        for kind in kinds:
-            dates, state = revision_status(kind)
-            if dates:
-                st.warning(f"{LAWS[kind][0]}：法令履歴に将来の施行日があります（{', '.join(dates[:5])}）。該当条項は未判定です。")
-            elif state == "取得不可":
-                st.caption(f"{LAWS[kind][0]}：未施行改正の履歴を取得できません。未施行がないという意味ではありません。")
-            else:
-                st.caption(f"{LAWS[kind][0]}：取得した履歴から将来の施行日を検出しませんでした。個別条項の施行状況は未判定です。")
-
-        st.subheader("施行令・施行規則との関連")
-        related = related_provisions(selected[:5], corpus)
-        if related:
-            st.caption("以下は条番号への言及に基づく検索候補です。委任関係の確定ではありません。")
-            for x in related:
-                st.write(f"・候補：{LAWS[x['kind']][0]} {label(x['article'])}")
-                with st.expander("候補条文の原文を確認"):
-                    st.text(paragraph_view(x["kind"], x["article"], corpus[x["kind"]][x["article"]]))
+        st.subheader("自治体の条例・規則等の確認")
+        checks = local_checks(refs[:7], corpus, names)
+        if checks:
+            st.warning("国の法令に、条例・規則等による具体化が必要と考えられる表現があります。各自治体の現行の条例・規則等を必ず確認してください。")
+            st.caption("このアプリは自治体例規を自動取得・検証しません。以下は機械的な候補抽出であり、網羅性や委任関係の確定を保証しません。")
+            for c in checks[:15]:
+                st.write(f"・**{c['source']}**：{c['type']}の確認が必要")
+                with st.expander("検出した条文の記載を確認"):
+                    st.text(c["excerpt"])
         else:
-            st.caption("対応する施行令・施行規則の条文を自動では特定できませんでした。関連規定が存在しないという意味ではありません。")
+            st.info("検索した条文から自治体例規への明示的な委任表現は検出されませんでした。ただし、自治体例規の確認が不要と確定したわけではありません。")
+        st.caption("金額、要件、手続など自治体固有の事項は、当該自治体の担当部署や公式例規集で確認してください。")
+
+        st.subheader("他の国の法令への引用候補")
+        mentions = national_mentions(refs[:7], corpus, names)
+        if mentions:
+            st.caption("以下は条文から抽出した文字列の候補です。引用先法令の同定・本文取得・適用関係の確認は未実施です。")
+            for m in mentions:
+                st.write("・" + m)
+            st.info("引用先の国の法令を根拠に加える場合は、サイドバーで正式な法令名とe-Gov法令IDを入力し、再検索してください。")
+        else:
+            st.caption("引用候補は検出されませんでした。引用関係がないことを意味しません。")
+
+        st.subheader("施行状況に関する注意")
+        st.info("API Version 1から取得した本文を表示しています。未施行改正の条項別判定は行っていません。")
+        for k, (_, law_id) in names.items():
+            dates, ok = revision_status(law_id)
+            if dates:
+                st.warning(f"{names[k][0]}：履歴から将来の施行日候補を検出しました（{', '.join(dates[:4])}）。該当条項は未判定です。")
+            elif not ok:
+                st.caption(f"{names[k][0]}：改正履歴を取得できませんでした。")
+            else:
+                st.caption(f"{names[k][0]}：取得した履歴から将来の施行日を検出しませんでした。未施行改正が存在しないことの証明ではありません。")
     except Exception as exc:
         st.error("取得または回答処理に失敗しました。")
         st.code(str(exc))
