@@ -7,8 +7,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="自治法AI Ver.7", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7｜国の法令と自治体例規の確認事項")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.2", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.2")
 st.caption("e-Govの法令原文を確認し、自治体の条例・規則等で別途確認すべき事項を表示します。")
 
 LAWS = {
@@ -329,31 +329,76 @@ if run:
             st.warning("根拠条文を特定できませんでした。改正履歴など、条文検索以外の質問には対応できない場合があります。")
             st.stop()
         st.subheader("条文検索結果")
-        st.write("、".join(f"{names[r['kind']][0]} {article_label(r['article'])}" for r in refs[:7]))
+        search_text = "\\n".join(
+            f"・{names[r['kind']][0]} {article_label(r['article'])}"
+            for r in refs[:7]
+        )
+        st.write(search_text)
+        st.code(search_text, language=None)
+        st.caption("上の枠のコピーアイコンで条文検索結果をコピーできます。")
         with st.spinner("根拠条文から回答を作成しています..."):
             answer, errors = generate_answer(question, refs, corpus, names, client, model, explicit)
 
+        # 重要な確認事項は回答より前に、大きく・明確に表示する。
+        # 回答の根拠として引用された項・号に絞り、別の論点の警告を混ぜにくくする。
+        all_checks = local_checks(refs[:7], corpus, names)
+        cited_checks = []
+        for check in all_checks:
+            for cite in answer.get("citations", []):
+                prefix = f"{names[cite['kind']][0]} {article_label(cite['article'])}"
+                if not check["source"].startswith(prefix + "第"):
+                    continue
+                if cite.get("paragraph") and f"第{cite['paragraph']}項" not in check["source"]:
+                    continue
+                if cite.get("item") and f"第{cite['item']}号" not in check["source"]:
+                    continue
+                cited_checks.append(check)
+                break
+        if cited_checks:
+            st.error("🚨【重要】この回答には、自治体の条例・規則等の確認が必要な事項があります。国の法令だけで最終判断しないでください。", icon="🚨")
+            st.markdown("### 🏛️ 必ず当該自治体で確認してください")
+            for check in cited_checks[:5]:
+                st.markdown(f"**● {check['type']}を確認：{check['source']}**")
+            st.markdown("**確認先：当該自治体の公式例規集・契約担当部署など**")
+            st.caption("このアプリは各自治体の条例・規則等を取得・検証していません。")
+        elif all_checks:
+            st.warning("⚠️【自治体例規の確認】検索候補の条文に条例・規則等への委任表現があります。今回の回答との関係は未確定です。下の詳細を確認してください。")
+
         st.subheader("AIの回答")
+        answer_lines = []
         if errors:
             st.error("回答の検証で問題を検出しました。解釈文は表示せず、根拠原文を確認してください。")
+            answer_lines.append("【検証で問題を検出：AIの解釈文は非表示】")
             for e in errors:
                 st.write("・" + e)
+                answer_lines.append("・" + e)
         else:
-            st.markdown("**結論**")
-            st.write(str(answer.get("conclusion", "")))
-            st.markdown("**説明**")
-            st.write(str(answer.get("explanation", "")))
+            for title, key in (("結論", "conclusion"), ("説明", "explanation")):
+                value = str(answer.get(key, ""))
+                st.markdown(f"**{title}**")
+                st.write(value)
+                answer_lines.extend([f"【{title}】", value, ""])
             for title, key in (("適用条件", "conditions"), ("注意点", "cautions")):
                 values = answer.get(key, [])
                 if isinstance(values, list) and values:
                     st.markdown(f"**{title}**")
+                    answer_lines.append(f"【{title}】")
                     for v in values:
                         st.write("・" + str(v))
+                        answer_lines.append("・" + str(v))
+                    answer_lines.append("")
         if answer["citations"]:
             st.markdown("**回答に用いた根拠条文**")
+            answer_lines.append("【回答に用いた根拠条文】")
             for c in answer["citations"]:
                 suffix = (f"第{c['paragraph']}項" if c["paragraph"] else "") + (f"第{c['item']}号" if c["item"] else "")
-                st.write(f"・{names[c['kind']][0]} {article_label(c['article'])}{suffix}")
+                citation_line = f"・{names[c['kind']][0]} {article_label(c['article'])}{suffix}"
+                st.write(citation_line)
+                answer_lines.append(citation_line)
+        answer_copy = "\\n".join(answer_lines).strip()
+        st.markdown("**AIの回答をコピー**")
+        st.code(answer_copy, language=None)
+        st.caption("上の枠のコピーアイコンでAIの回答をまとめてコピーできます。")
 
         # 引用された条文を最優先に表示する。AI回答が抑止されても原文は表示する。
         st.subheader("e-Govから取得した根拠条文原文")
@@ -367,6 +412,13 @@ if run:
             key = (r["kind"], r["article"])
             if key not in priority:
                 priority.append(key)
+        original_texts = [
+            render_article(names[k][0], n, corpus[k][n])
+            for k, n in priority
+        ]
+        st.markdown("**根拠条文原文をまとめてコピー**")
+        st.code("\\n\\n".join(original_texts), language=None)
+        st.caption("上の枠のコピーアイコンで表示対象の条文原文を一括コピーできます。")
         for index, (k, n) in enumerate(priority):
             citation = next((c for c in answer["citations"] if c["kind"] == k and c["article"] == n), None)
             heading = f"{names[k][0]} {article_label(n)}"
@@ -375,9 +427,9 @@ if run:
                 st.link_button("e-Govで法令を確認", f"https://laws.e-gov.go.jp/law/{names[k][1]}")
 
         st.subheader("自治体の条例・規則等の確認")
-        checks = local_checks(refs[:7], corpus, names)
+        checks = cited_checks if cited_checks else all_checks
         if checks:
-            st.warning("国の法令に、条例・規則等による具体化が必要と考えられる表現があります。各自治体の現行の条例・規則等を必ず確認してください。")
+            st.warning("⚠️ 自治体の現行の条例・規則等を確認してください。上部の重要警告は、回答に引用された条項を優先しています。")
             st.caption("このアプリは自治体例規を自動取得・検証しません。以下は機械的な候補抽出であり、網羅性や委任関係の確定を保証しません。")
             for c in checks[:15]:
                 st.write(f"・**{c['source']}**：{c['type']}の確認が必要")
