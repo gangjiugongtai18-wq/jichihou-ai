@@ -1,3 +1,4 @@
+
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -8,31 +9,41 @@ from openai import OpenAI
 
 
 # =========================================================
-# Streamlit 基本設定
+# 自治法AI Ver.4
 # =========================================================
 
 st.set_page_config(
-    page_title="自治法AI",
+    page_title="自治法AI Ver.4",
     page_icon="⚖️"
 )
 
 st.title("⚖️ 自治法AI")
-st.caption("地方自治法に特化したAI法令検索")
+st.caption("Ver.4｜地方自治法・自然言語検索")
 st.info(
     "質問の意味をAIが分析し、"
-    "e-Govから取得した地方自治法の条文を参照して回答します。"
+    "e-Govの地方自治法本文を確認して回答します。"
 )
 
 
 # =========================================================
-# 地方自治法
+# 基本設定
 # =========================================================
 
 LAW_ID = "322AC0000000067"
-LAW_URL = f"https://laws.e-gov.go.jp/api/1/lawdata/{LAW_ID}"
-EGOV_URL = f"https://laws.e-gov.go.jp/law/{LAW_ID}"
+
+LAW_URL = (
+    f"https://laws.e-gov.go.jp/api/1/lawdata/{LAW_ID}"
+)
+
+EGOV_URL = (
+    f"https://laws.e-gov.go.jp/law/{LAW_ID}"
+)
 
 MODEL_NAME = "gemini-3.5-flash-lite"
+
+MAX_CANDIDATES = 12
+MAX_SELECTED = 5
+MAX_ARTICLE_CHARS = 6000
 
 
 # =========================================================
@@ -49,28 +60,20 @@ def get_law():
 
     response.raise_for_status()
 
-    root = ET.fromstring(
-        response.content
-    )
+    root = ET.fromstring(response.content)
 
     articles = []
 
     for article in root.findall(".//Article"):
 
-        num = article.get(
-            "Num",
-            ""
-        ).strip()
+        num = article.get("Num", "").strip()
 
         text = "".join(
             article.itertext()
         ).strip()
 
         if num and text:
-
-            articles.append(
-                (num, text)
-            )
+            articles.append((num, text))
 
     return articles
 
@@ -81,30 +84,54 @@ def get_law():
 
 def get_ai_client():
 
-    gemini_key = st.secrets.get(
-        "GEMINI_API_KEY"
-    )
+    key = st.secrets.get("GEMINI_API_KEY")
 
-    if not gemini_key:
-
+    if not key:
         st.error(
-            "StreamlitのSecretsに"
+            "Streamlit Secretsに"
             "GEMINI_API_KEYを設定してください。"
         )
-
         st.stop()
 
     return OpenAI(
-        api_key=gemini_key,
+        api_key=key,
         base_url=(
             "https://generativelanguage.googleapis.com/"
             "v1beta/openai/"
-        )
+        ),
+        timeout=60.0
     )
 
 
 # =========================================================
-# JSON文字列を安全に取り出す
+# Gemini呼び出し
+# =========================================================
+
+def ask_gemini(client, system_prompt, user_prompt):
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        temperature=0.1
+    )
+
+    return (
+        response.choices[0].message.content
+        or ""
+    )
+
+
+# =========================================================
+# JSON抽出
 # =========================================================
 
 def extract_json(text):
@@ -114,7 +141,6 @@ def extract_json(text):
 
     text = text.strip()
 
-    # ```json ～ ``` を除去
     text = re.sub(
         r"^```(?:json)?\s*",
         "",
@@ -129,12 +155,14 @@ def extract_json(text):
     )
 
     try:
-        return json.loads(text)
+        result = json.loads(text)
 
-    except json.JSONDecodeError:
+        if isinstance(result, dict):
+            return result
+
+    except (ValueError, TypeError):
         pass
 
-    # JSON部分だけを探す
     match = re.search(
         r"\{.*\}",
         text,
@@ -145,19 +173,19 @@ def extract_json(text):
         return None
 
     try:
-        return json.loads(
-            match.group(0)
-        )
+        result = json.loads(match.group(0))
 
-    except json.JSONDecodeError:
-        return None
+        if isinstance(result, dict):
+            return result
+
+    except (ValueError, TypeError):
+        pass
+
+    return None
 
 
 # =========================================================
-# 条番号を正規化
-# 例：
-# "179" → "179"
-# "第179条" → "179"
+# 条番号の正規化
 # =========================================================
 
 def normalize_article_number(value):
@@ -167,313 +195,343 @@ def normalize_article_number(value):
 
     value = str(value).strip()
 
+    # 第179条、第179条の2、179-2などに対応
     match = re.search(
-        r"(\d+)",
+        r"(\d+)(?:\s*(?:条の|の|-)\s*(\d+))?",
         value
     )
 
     if not match:
         return None
 
-    return match.group(1)
+    main = str(int(match.group(1)))
+    sub = match.group(2)
+
+    if sub:
+        return f"{main}_{int(sub)}"
+
+    return main
+
+
+def article_label(num):
+
+    parts = str(num).split("_")
+
+    if len(parts) == 2:
+        return f"第{parts[0]}条の{parts[1]}"
+
+    return f"第{num}条"
 
 
 # =========================================================
-# 質問をGeminiに分析させる
+# 質問に明示された条番号
 # =========================================================
 
-def analyze_question(
-    question,
-    client
-):
+def get_direct_articles(question):
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "あなたは日本の地方自治法の"
-                    "条文検索を補助するAIです。"
-
-                    "利用者の質問を分析し、"
-                    "地方自治法上の法的論点、"
-                    "関係する可能性が高い条番号、"
-                    "条文検索に使う法律用語を"
-                    "推定してください。"
-
-                    "日常語を法律用語に"
-                    "言い換えることが重要です。"
-
-                    "例えば、"
-                    "『市長が辞めた』という表現から、"
-                    "『長が欠けた場合』"
-                    "『職務代理』などの"
-                    "法律用語を検討してください。"
-
-                    "ただし、分からない条番号を"
-                    "無理に作らないでください。"
-
-                    "候補条文は最大5件にしてください。"
-
-                    "必ず次のJSON形式だけで"
-                    "回答してください。"
-
-                    "{"
-                    "\"issue\":\"法的論点\","
-                    "\"candidate_articles\":[\"179\",\"180\"],"
-                    "\"keywords\":["
-                    "\"専決処分\","
-                    "\"議会\","
-                    "\"長\""
-                    "]"
-                    "}"
-
-                    "JSON以外の説明文は"
-                    "絶対に書かないでください。"
-                )
-            },
-            {
-                "role": "user",
-                "content": question
-            }
-        ]
+    matches = re.findall(
+        r"第\s*(\d+)\s*条(?:の\s*(\d+))?",
+        question
     )
 
-    result = (
-        response.choices[0]
-        .message.content
-        or ""
+    result = []
+
+    for main, sub in matches:
+
+        num = str(int(main))
+
+        if sub:
+            num += f"_{int(sub)}"
+
+        if num not in result:
+            result.append(num)
+
+    if not result:
+
+        if re.fullmatch(r"\s*\d+\s*", question):
+            result.append(str(int(question.strip())))
+
+    return result[:5]
+
+
+# =========================================================
+# AIによる質問分析
+# =========================================================
+
+def analyze_question(question, client):
+
+    system_prompt = """
+あなたは日本の地方自治法の条文検索を補助するAIです。
+
+利用者の曖昧な日常語を法律概念に変換してください。
+
+質問について、次を分析してください。
+
+1. 中心となる法的論点
+2. 合理的に考えられる複数の解釈
+3. 各解釈に対応する法律概念
+4. 関係する可能性がある地方自治法の条番号
+5. 条文検索に使うキーワード
+
+例：
+
+「市長がいなくなったら誰が仕切るの？」
+
+考えられる解釈：
+・市長が欠けた場合の職務代理
+・市長が一時的に職務を行えない場合の代理
+
+法律概念：
+・長が欠けたとき
+・長に事故があるとき
+・職務代理
+
+候補条文：
+・第152条
+
+別の例：
+
+「議会がごちゃごちゃして決めてくれない」
+
+考えられる解釈：
+・議会が議決しない場合
+・議会が成立しない場合
+・議会を招集する時間的余裕がない場合
+
+候補条文：
+・第179条
+
+注意：
+・候補条番号は推定にすぎません。
+・条文の実在や内容は後続処理で確認します。
+・確信できない条番号を無理に作らないでください。
+・解釈は最大3件としてください。
+・候補条文は最大8件としてください。
+
+次のJSON形式だけを返してください。
+
+{
+  "issue": "中心となる法的論点",
+  "interpretations": [
+    {
+      "meaning": "解釈",
+      "legal_concepts": ["法律概念"],
+      "candidate_articles": ["179"]
+    }
+  ],
+  "candidate_articles": ["179", "180"],
+  "keywords": ["専決処分", "議会", "議決"]
+}
+
+JSON以外の文章を書かないでください。
+"""
+
+    result = ask_gemini(
+        client,
+        system_prompt,
+        question
     )
 
-    data = extract_json(
-        result
-    )
+    data = extract_json(result)
 
     if not data:
-
         return {
             "issue": "",
+            "interpretations": [],
             "candidate_articles": [],
             "keywords": []
         }
 
     issue = str(
-        data.get(
-            "issue",
-            ""
-        )
+        data.get("issue", "")
     ).strip()
 
-    raw_articles = data.get(
-        "candidate_articles",
-        []
+    raw_interpretations = data.get(
+        "interpretations", []
     )
 
-    raw_keywords = data.get(
-        "keywords",
-        []
-    )
+    if not isinstance(raw_interpretations, list):
+        raw_interpretations = []
 
-    if not isinstance(
-        raw_articles,
-        list
-    ):
-        raw_articles = []
-
-    if not isinstance(
-        raw_keywords,
-        list
-    ):
-        raw_keywords = []
-
-    candidate_articles = []
-
-    for value in raw_articles:
-
-        num = normalize_article_number(
-            value
-        )
-
-        if (
-            num
-            and num not in candidate_articles
-        ):
-            candidate_articles.append(
-                num
-            )
-
+    interpretations = []
+    candidate_numbers = []
     keywords = []
 
-    for word in raw_keywords:
+    def add_number(value):
 
-        word = str(
-            word
-        ).strip()
+        num = normalize_article_number(value)
+
+        if num and num not in candidate_numbers:
+            candidate_numbers.append(num)
+
+    def add_keyword(value):
+
+        if not isinstance(value, str):
+            return
+
+        value = value.strip()
 
         if (
-            len(word) >= 2
-            and word not in keywords
+            2 <= len(value) <= 30
+            and value not in keywords
         ):
-            keywords.append(
-                word
-            )
+            keywords.append(value)
+
+    for item in raw_interpretations[:3]:
+
+        if not isinstance(item, dict):
+            continue
+
+        meaning = str(
+            item.get("meaning", "")
+        ).strip()
+
+        concepts = item.get(
+            "legal_concepts", []
+        )
+
+        numbers = item.get(
+            "candidate_articles", []
+        )
+
+        if not isinstance(concepts, list):
+            concepts = []
+
+        if not isinstance(numbers, list):
+            numbers = []
+
+        clean_concepts = []
+        clean_numbers = []
+
+        for concept in concepts[:5]:
+
+            if isinstance(concept, str):
+                concept = concept.strip()
+
+                if concept:
+                    clean_concepts.append(concept)
+                    add_keyword(concept)
+
+        for number in numbers[:5]:
+
+            num = normalize_article_number(number)
+
+            if num:
+                clean_numbers.append(num)
+                add_number(num)
+
+        interpretations.append({
+            "meaning": meaning,
+            "legal_concepts": clean_concepts,
+            "candidate_articles": clean_numbers
+        })
+
+    raw_numbers = data.get(
+        "candidate_articles", []
+    )
+
+    if isinstance(raw_numbers, list):
+
+        for number in raw_numbers[:8]:
+            add_number(number)
+
+    raw_keywords = data.get(
+        "keywords", []
+    )
+
+    if isinstance(raw_keywords, list):
+
+        for word in raw_keywords[:12]:
+            add_keyword(word)
 
     return {
         "issue": issue,
-        "candidate_articles":
-            candidate_articles[:5],
-        "keywords":
-            keywords[:10]
+        "interpretations": interpretations,
+        "candidate_articles": candidate_numbers[:8],
+        "keywords": keywords[:15]
     }
 
 
 # =========================================================
-# 質問に条番号が直接書かれているか
+# 条文番号で検索
 # =========================================================
 
-def get_direct_article_number(
-    question
-):
+def get_articles_by_numbers(numbers, articles):
 
-    match = re.search(
-        r"第\s*(\d+)\s*条",
-        question
-    )
+    wanted = set(numbers)
 
-    if match:
-        return match.group(1)
-
-    match = re.fullmatch(
-        r"\s*(\d+)\s*",
-        question
-    )
-
-    if match:
-        return match.group(1)
-
-    return None
-
-
-# =========================================================
-# 条番号から実際の条文を取得
-# =========================================================
-
-def get_articles_by_numbers(
-    numbers,
-    articles
-):
-
-    wanted = set(
-        numbers
-    )
-
-    result = []
-
-    for num, text in articles:
-
-        if num in wanted:
-
-            result.append(
-                (num, text)
-            )
-
-    return result
+    return [
+        (num, text)
+        for num, text in articles
+        if num in wanted
+    ]
 
 
 # =========================================================
 # キーワードによる補助検索
 # =========================================================
 
-def keyword_search(
-    keywords,
-    articles,
-    limit=5
-):
+def keyword_search(keywords, articles, limit=8):
 
     scored = []
 
     for num, text in articles:
 
         score = 0
-        matched_words = 0
+        matched = 0
 
         for word in keywords:
 
-            count = text.count(
-                word
-            )
+            if len(word) < 2:
+                continue
+
+            count = text.count(word)
 
             if count > 0:
 
-                matched_words += 1
+                matched += 1
 
-                # 基本点
-                score += count
+                score += min(count, 5)
 
-                # 長い法律用語を高く評価
                 if len(word) >= 4:
-                    score += 3
+                    score += 4
 
                 elif len(word) >= 3:
                     score += 2
 
-        # 複数の検索語が同じ条文に
-        # 含まれる場合は追加点
-        if matched_words >= 2:
-            score += (
-                matched_words * 2
-            )
+        if matched >= 2:
+            score += matched * 3
 
         if score > 0:
-
-            scored.append(
-                (
-                    score,
-                    num,
-                    text
-                )
-            )
+            scored.append((score, num, text))
 
     scored.sort(
-        key=lambda x: x[0],
+        key=lambda item: item[0],
         reverse=True
     )
 
     return [
         (num, text)
-        for score, num, text
-        in scored[:limit]
+        for _, num, text in scored[:limit]
     ]
 
 
 # =========================================================
-# 重複条文を除去
+# 候補条文を統合
 # =========================================================
 
-def merge_articles(
-    primary,
-    secondary,
-    limit=5
-):
+def merge_articles(primary, secondary, limit=12):
 
     merged = []
     seen = set()
 
-    for num, text in (
-        primary + secondary
-    ):
+    for num, text in primary + secondary:
 
         if num in seen:
             continue
 
-        seen.add(
-            num
-        )
-
-        merged.append(
-            (num, text)
-        )
+        seen.add(num)
+        merged.append((num, text))
 
         if len(merged) >= limit:
             break
@@ -482,412 +540,535 @@ def merge_articles(
 
 
 # =========================================================
-# 関連条文を検索
+# AIによる関連性の再評価
 # =========================================================
 
-def find_articles(
+def rerank_articles(
     question,
-    articles,
+    analysis,
+    candidates,
     client
 ):
 
-    # -----------------------------------------------------
-    # 1. 条番号が直接指定された場合
-    # -----------------------------------------------------
+    if not candidates:
+        return [], []
 
-    direct_number = (
-        get_direct_article_number(
-            question
+    context = "\n\n".join(
+        (
+            f"条番号：{article_label(num)}\n"
+            f"条文本文：\n{text[:MAX_ARTICLE_CHARS]}"
         )
+        for num, text in candidates
     )
 
-    if direct_number:
+    system_prompt = """
+あなたは地方自治法の条文検索の審査担当AIです。
 
-        selected = (
-            get_articles_by_numbers(
-                [direct_number],
-                articles
+利用者の質問と、e-Govから取得された条文本文を比較し、
+本当に回答の根拠になる条文を選別してください。
+
+判定区分：
+
+direct：
+質問への直接の法的根拠となる条文
+
+supporting：
+直接の根拠を補足するために必要な条文
+
+irrelevant：
+質問への回答に不要な条文
+
+uncertain：
+関連性を確定できない条文
+
+重要なルール：
+
+・条番号の推定結果だけで採用しない。
+・必ず提示された条文本文を確認する。
+・文字列が一致するだけでは採用しない。
+・質問に答えるために不要な条文は除外する。
+・複数解釈がある場合は、それぞれを考慮する。
+・判断できない条文は無理に採用しない。
+・提示されていない条番号を追加しない。
+・最大5条文を選択する。
+・直接の根拠がなければ空配列を許容する。
+
+次のJSON形式だけを返してください。
+
+{
+  "evaluations": [
+    {
+      "article": "179",
+      "relevance": "direct",
+      "reason": "議会が議決しない場合の規定"
+    }
+  ],
+  "selected_articles": ["179"],
+  "sufficient_evidence": true,
+  "ambiguity_note": "複数解釈がある場合の説明"
+}
+
+JSON以外の文章を書かないでください。
+"""
+
+    user_prompt = (
+        f"利用者の質問：\n{question}\n\n"
+        f"推定された法的論点：\n"
+        f"{analysis.get('issue', '')}\n\n"
+        f"取得した条文：\n{context}"
+    )
+
+    result = ask_gemini(
+        client,
+        system_prompt,
+        user_prompt
+    )
+
+    data = extract_json(result)
+
+    if not data:
+        return [], []
+
+    valid_articles = {
+        num: text
+        for num, text in candidates
+    }
+
+    raw_evaluations = data.get(
+        "evaluations", []
+    )
+
+    evaluations = []
+
+    if isinstance(raw_evaluations, list):
+
+        for item in raw_evaluations:
+
+            if not isinstance(item, dict):
+                continue
+
+            num = normalize_article_number(
+                item.get("article")
             )
+
+            if num not in valid_articles:
+                continue
+
+            relevance = str(
+                item.get("relevance", "")
+            ).strip().lower()
+
+            if relevance not in (
+                "direct",
+                "supporting",
+                "irrelevant",
+                "uncertain"
+            ):
+                relevance = "uncertain"
+
+            evaluations.append({
+                "article": num,
+                "relevance": relevance,
+                "reason": str(
+                    item.get("reason", "")
+                ).strip()
+            })
+
+    # AIのselected_articlesを無条件に信用せず、
+    # evaluationsでdirect/supportingとされたものだけ採用
+    approved = {
+        item["article"]: item["relevance"]
+        for item in evaluations
+        if item["relevance"] in (
+            "direct",
+            "supporting"
         )
+    }
 
-        analysis = {
-            "issue":
-                "利用者が条番号を直接指定",
-            "candidate_articles":
-                [direct_number],
-            "keywords":
-                []
-        }
+    direct_numbers = [
+        num
+        for num, status in approved.items()
+        if status == "direct"
+    ]
 
-        return (
-            selected,
-            analysis
+    # 直接の根拠がなければ、
+    # 補助条文だけで回答を作らない
+    if not direct_numbers:
+        return [], evaluations
+
+    raw_selected = data.get(
+        "selected_articles", []
+    )
+
+    if not isinstance(raw_selected, list):
+        raw_selected = []
+
+    selected_numbers = []
+
+    for value in raw_selected:
+
+        num = normalize_article_number(value)
+
+        if (
+            num in approved
+            and num not in selected_numbers
+        ):
+            selected_numbers.append(num)
+
+    # JSONの選択リストに直接根拠が
+    # 欠落していても、評価結果を優先する
+    for num in direct_numbers:
+
+        if num not in selected_numbers:
+            selected_numbers.insert(0, num)
+
+    for num, status in approved.items():
+
+        if (
+            status == "supporting"
+            and num not in selected_numbers
+        ):
+            selected_numbers.append(num)
+
+    selected_numbers = selected_numbers[:MAX_SELECTED]
+
+    selected = [
+        (num, valid_articles[num])
+        for num in selected_numbers
+        if num in valid_articles
+    ]
+
+    return selected, evaluations
+
+
+# =========================================================
+# 最終回答の生成
+# =========================================================
+
+def generate_answer(
+    question,
+    analysis,
+    selected,
+    client
+):
+
+    context = "\n\n".join(
+        (
+            f"{article_label(num)}\n"
+            f"{text[:MAX_ARTICLE_CHARS]}"
         )
-
-
-    # -----------------------------------------------------
-    # 2. Geminiが質問の法的論点を分析
-    # -----------------------------------------------------
-
-    analysis = analyze_question(
-        question,
-        client
+        for num, text in selected
     )
 
-    candidate_numbers = (
-        analysis[
-            "candidate_articles"
-        ]
+    interpretations = analysis.get(
+        "interpretations", []
     )
 
-    keywords = (
-        analysis[
-            "keywords"
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # 3. Geminiが推定した条番号を
-    #    e-Govデータから取得
-    # -----------------------------------------------------
-
-    candidate_results = (
-        get_articles_by_numbers(
-            candidate_numbers,
-            articles
+    interpretation_text = "\n".join(
+        (
+            f"・{item.get('meaning', '')}"
         )
+        for item in interpretations
     )
 
+    system_prompt = """
+あなたは日本の地方自治法の調査補助AIです。
 
-    # -----------------------------------------------------
-    # 4. キーワード検索も実施
-    # -----------------------------------------------------
+提示されたe-Gov由来の条文本文を根拠として、
+日本語で分かりやすく回答してください。
 
-    keyword_results = (
-        keyword_search(
-            keywords,
-            articles,
-            limit=5
-        )
+厳守事項：
+
+1. 提示されていない条文を根拠にしない。
+2. 条文にない内容を断定しない。
+3. 条番号と、確認できる項番号・号番号を示す。
+4. 複数解釈が合理的に成立する場合は区別する。
+5. 根拠が不足する場合は判断できないと説明する。
+6. 質問に直接関係しない情報を増やさない。
+7. 法令の引用とAIによる説明を区別する。
+
+回答の基本構成：
+
+【結論】
+質問への簡潔な回答
+
+【根拠条文】
+根拠となる条番号・項番号・号番号
+
+【説明】
+条文の意味と適用上の注意
+
+【解釈上の注意】
+複数解釈や判断できない点があれば記載
+
+条文本文にない具体的事実や
+判例・行政実例を作り出してはいけません。
+"""
+
+    user_prompt = (
+        f"質問：\n{question}\n\n"
+        f"考えられる解釈：\n"
+        f"{interpretation_text}\n\n"
+        f"確認済みの根拠条文：\n"
+        f"{context}"
     )
 
-
-    # -----------------------------------------------------
-    # 5. 候補条番号を優先し、
-    #    キーワード検索結果を補完
-    # -----------------------------------------------------
-
-    selected = merge_articles(
-        candidate_results,
-        keyword_results,
-        limit=5
-    )
-
-    return (
-        selected,
-        analysis
+    return ask_gemini(
+        client,
+        system_prompt,
+        user_prompt
     )
 
 
 # =========================================================
-# 質問入力
+# 画面：質問入力
 # =========================================================
 
 question = st.text_area(
     "地方自治法について質問してください",
     placeholder=(
-        "例：議会を招集する時間がないとき、"
-        "首長はどうすればいい？"
-    )
+        "例：議会がごちゃごちゃして"
+        "何も決めてくれないとき、"
+        "市長だけで決められないの？"
+    ),
+    height=120
+)
+
+search_button = st.button(
+    "AIに質問する",
+    type="primary"
 )
 
 
 # =========================================================
-# 質問ボタン
+# メイン処理
 # =========================================================
 
-if st.button(
-    "AIに質問する"
-):
+if search_button:
 
     if not question.strip():
-
-        st.warning(
-            "質問を入力してください。"
-        )
-
+        st.warning("質問を入力してください。")
         st.stop()
 
     try:
 
-        # -------------------------------------------------
-        # Gemini
-        # -------------------------------------------------
-
         client = get_ai_client()
 
-
-        # -------------------------------------------------
-        # 地方自治法を取得
-        # -------------------------------------------------
-
         with st.spinner(
-            "質問の意味と地方自治法を"
-            "調査しています..."
+            "地方自治法を取得しています..."
         ):
-
             articles = get_law()
 
-            selected, analysis = (
-                find_articles(
-                    question,
-                    articles,
-                    client
-                )
+        if not articles:
+            st.error(
+                "地方自治法の条文を取得できませんでした。"
+            )
+            st.stop()
+
+        # ---------------------------------------------
+        # 1. 質問分析
+        # ---------------------------------------------
+
+        with st.spinner(
+            "質問の意味を分析しています..."
+        ):
+
+            analysis = analyze_question(
+                question,
+                client
             )
 
+        # 利用者が直接指定した条文は必ず候補に追加
+        direct_numbers = get_direct_articles(
+            question
+        )
 
-        # -------------------------------------------------
-        # 検索分析結果
-        # -------------------------------------------------
+        candidate_numbers = list(
+            direct_numbers
+        )
+
+        for num in analysis.get(
+            "candidate_articles", []
+        ):
+
+            if num not in candidate_numbers:
+                candidate_numbers.append(num)
+
+        # ---------------------------------------------
+        # 2. 候補条文の取得
+        # ---------------------------------------------
+
+        primary = get_articles_by_numbers(
+            candidate_numbers,
+            articles
+        )
+
+        secondary = keyword_search(
+            analysis.get("keywords", []),
+            articles,
+            limit=8
+        )
+
+        candidates = merge_articles(
+            primary,
+            secondary,
+            limit=MAX_CANDIDATES
+        )
+
+        # ---------------------------------------------
+        # 3. 関連性の再評価
+        # ---------------------------------------------
+
+        with st.spinner(
+            "候補条文の関連性を確認しています..."
+        ):
+
+            selected, evaluations = rerank_articles(
+                question,
+                analysis,
+                candidates,
+                client
+            )
+
+        # ---------------------------------------------
+        # 4. 検索分析の表示
+        # ---------------------------------------------
 
         with st.expander(
             "AIによる検索分析"
         ):
 
-            issue = analysis.get(
-                "issue",
-                ""
-            )
-
-            candidates = analysis.get(
-                "candidate_articles",
-                []
-            )
-
-            keywords = analysis.get(
-                "keywords",
-                []
-            )
+            st.write("**中心となる法的論点**")
 
             st.write(
-                "**法的論点**"
+                analysis.get("issue")
+                or "特定できませんでした。"
             )
 
-            st.write(
-                issue
-                if issue
-                else "特定できませんでした。"
+            st.write("**考えられる解釈**")
+
+            interpretations = analysis.get(
+                "interpretations", []
             )
 
-            st.write(
-                "**候補条文**"
-            )
+            if interpretations:
+
+                for item in interpretations:
+
+                    st.write(
+                        "・" + item.get(
+                            "meaning", ""
+                        )
+                    )
+
+            else:
+                st.write("特定できませんでした。")
+
+            st.write("**候補条文**")
 
             if candidates:
 
                 st.write(
                     " / ".join(
-                        f"第{num}条"
-                        for num in candidates
+                        article_label(num)
+                        for num, _ in candidates
                     )
                 )
 
             else:
+                st.write("候補なし")
 
-                st.write(
-                    "候補なし"
-                )
+            st.write("**関連性の再評価**")
 
-            st.write(
-                "**検索キーワード**"
-            )
+            if evaluations:
 
-            if keywords:
+                for item in evaluations:
 
-                st.write(
-                    " / ".join(
-                        keywords
+                    st.write(
+                        f"{article_label(item['article'])}"
+                        f"：{item['relevance']}"
+                        f" — {item['reason']}"
                     )
-                )
 
             else:
+                st.write("評価結果なし")
 
-                st.write(
-                    "なし"
-                )
-
-
-        # -------------------------------------------------
-        # 条文が見つからない
-        # -------------------------------------------------
+        # ---------------------------------------------
+        # 5. 根拠不足の場合
+        # ---------------------------------------------
 
         if not selected:
 
             st.warning(
-                "関連する地方自治法の条文を"
-                "特定できませんでした。"
-                "質問の表現を変えるか、"
-                "条番号・制度名などを"
-                "入力してください。"
+                "取得した条文の中に、"
+                "質問への直接の根拠を"
+                "確認できませんでした。"
+                "推測による法律上の結論は"
+                "表示しません。"
+            )
+
+            st.markdown(
+                f"[e-Govで地方自治法を確認]"
+                f"({EGOV_URL})"
             )
 
             st.stop()
 
-
-        # -------------------------------------------------
-        # 回答AIに渡す条文
-        # -------------------------------------------------
-
-        context = "\n\n".join(
-            (
-                f"第{num}条\n"
-                f"{text[:4000]}"
-            )
-            for num, text
-            in selected
-        )
-
-
-        # -------------------------------------------------
-        # 最終回答
-        # -------------------------------------------------
+        # ---------------------------------------------
+        # 6. 回答生成
+        # ---------------------------------------------
 
         with st.spinner(
-            "条文を確認して"
-            "AIが回答を作成しています..."
+            "確認した条文を根拠に"
+            "回答を作成しています..."
         ):
 
-            response = (
-                client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "あなたは地方自治法の"
-                                "調査補助AIです。"
-
-                                "利用者の質問に対し、"
-                                "提示されたe-Gov由来の"
-                                "地方自治法の条文を"
-                                "主要な根拠として"
-                                "回答してください。"
-
-                                "提示された条文の中に"
-                                "質問への直接の根拠が"
-                                "存在するかを最初に"
-                                "慎重に確認してください。"
-
-                                "回答は原則として、"
-                                "『結論』"
-                                "『根拠となる条文』"
-                                "『説明』"
-                                "の順に整理してください。"
-
-                                "根拠となる条番号と、"
-                                "分かる場合は項番号も"
-                                "明示してください。"
-
-                                "候補として提示された条文が"
-                                "質問と関係しない場合は、"
-                                "無理にその条文を根拠に"
-                                "回答しないでください。"
-
-                                "提示された条文だけでは"
-                                "判断できない場合は、"
-                                "その旨を明確に"
-                                "回答してください。"
-
-                                "条文に書かれていない内容を"
-                                "条文に書かれているかのように"
-                                "断定してはいけません。"
-
-                                "推測で条文内容を"
-                                "補わないでください。"
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"質問：\n"
-                                f"{question}\n\n"
-
-                                f"検索AIが整理した法的論点：\n"
-                                f"{analysis.get('issue', '')}\n\n"
-
-                                f"参考条文：\n"
-                                f"{context}"
-                            )
-                        }
-                    ]
-                )
+            answer = generate_answer(
+                question,
+                analysis,
+                selected,
+                client
             )
 
+        # ---------------------------------------------
+        # 7. 回答表示
+        # ---------------------------------------------
 
-        # -------------------------------------------------
-        # 回答表示
-        # -------------------------------------------------
-
-        st.subheader(
-            "AIの回答"
-        )
-
-        answer = (
-            response.choices[0]
-            .message.content
-            or "回答がありませんでした。"
-        )
+        st.subheader("AIの回答")
 
         st.write(
-            answer
+            answer or "回答がありませんでした。"
         )
 
+        # ---------------------------------------------
+        # 8. 参照条文
+        # ---------------------------------------------
 
-        # -------------------------------------------------
-        # 参照条文
-        # -------------------------------------------------
-
-        st.subheader(
-            "参照した条文"
-        )
+        st.subheader("根拠として採用した条文")
 
         for num, text in selected:
 
             with st.expander(
-                f"第{num}条"
+                article_label(num)
             ):
+                st.write(text)
 
-                st.write(
-                    text
-                )
-
-
-        # -------------------------------------------------
-        # e-Gov
-        # -------------------------------------------------
+        # ---------------------------------------------
+        # 9. e-Govへのリンク
+        # ---------------------------------------------
 
         st.markdown(
             f"[e-Govで地方自治法を確認]"
             f"({EGOV_URL})"
         )
 
-
-        # -------------------------------------------------
-        # 注意事項
-        # -------------------------------------------------
-
         st.caption(
-            "この回答はAIによる法令調査の"
-            "参考情報です。"
-            "AIによる条文候補の選択や回答には"
+            "このサービスは法令調査の補助ツールです。"
+            "AIによる条文検索・関連性判定・回答には"
             "誤りが生じる可能性があります。"
-            "重要な判断では、最新の法令、"
-            "公的資料、判例・行政実例等を"
-            "直接確認してください。"
+            "重要な判断では、最新の法令本文、"
+            "判例、行政実例等を直接確認してください。"
         )
-
 
     except Exception as e:
 
@@ -896,5 +1077,5 @@ if st.button(
         )
 
         st.caption(
-            f"{type(e).__name__}: {e}"
+            f"エラーの種類：{type(e).__name__}"
         )
