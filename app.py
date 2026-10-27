@@ -8,8 +8,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.3.1", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.3.1")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.4")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -95,14 +95,36 @@ def fetch_law(law_id):
             continue
         paragraphs = parse_article(node)
         if paragraphs:
-            plain = "\n".join(
-                p["text"] + " " + " ".join(i["text"] for i in p["items"])
-                for p in paragraphs
-            )
+            plain = "\n".join(p["text"] + " " + " ".join(i["text"] for i in p["items"]) for p in paragraphs)
             articles[num] = {"paragraphs": paragraphs, "text": plain}
     if not articles:
         raise ValueError(f"法令ID {law_id} の条文が見つかりません")
-    return articles
+    # 本則の条文とは別に、法令本文の別表を取得する。
+    annexes = {}
+    body = root.find(".//LawBody")
+    if body is not None:
+        for node in body.findall("./AppdxTable"):
+            title = node_text(node.find("./AppdxTableTitle"))
+            text = node_text(node)
+            if title and text:
+                annexes[title] = text
+    return {"articles": articles, "annexes": annexes}
+
+
+def related_annexes(question, refs, annexes):
+    wanted = []
+    if "別表第五" in question or any(r["kind"] == "令" and r["article"] == "167_2" for r in refs):
+        wanted.append("別表第五")
+    if "別表第三" in question or any(r["kind"] == "令" and r["article"] == "121_2_2" for r in refs):
+        wanted.append("別表第三")
+    result, missing = [], []
+    for name in wanted:
+        found = [(title, text) for title, text in annexes.get("令", {}).items() if name in title.replace(" ", "")]
+        if found:
+            result.extend(("地方自治法施行令 " + title, text) for title, text in found)
+        else:
+            missing.append("地方自治法施行令 " + name)
+    return result, missing
 
 
 @st.cache_data(ttl=43200, show_spinner=False)
@@ -176,26 +198,23 @@ def explicit_refs(question, law_names):
 
 def find_candidates(question, corpus, names, client, model):
     explicit = explicit_refs(question, names)
-    system = """あなたは法令検索用の条番号候補抽出器です。法的結論は出さないでください。
-JSONのみ: {"candidates":[{"kind":"法","article":"234"}]}
-kindは入力で示す識別子のみ。条番号は半角数字、枝番号は167_2形式。
-確信のない条番号を捏造しない。"""
+    # 既知の委任関係を優先。対象条文が実際に取得できた場合のみ候補にする。
+    guided = []
+    if "随意契約" in question or "167条の2" in question.translate(DIGITS):
+        guided += [{"kind": "法", "article": "234"}, {"kind": "令", "article": "167_2"}]
+    if ("議決" in question and "契約" in question) or "96条" in question.translate(DIGITS):
+        guided += [{"kind": "法", "article": "96"}, {"kind": "令", "article": "121_2_2"}]
+    system = """法令検索の条番号候補だけをJSONで返してください。
+形式: {"candidates":[{"kind":"法","article":"234"}]}
+識別子は入力されたもののみ。推測で条番号を作らない。"""
     try:
-        ai = ai_json(client, model, system, "法令識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items()) + "\n質問: " + question, 900)
+        ai = ai_json(client, model, system,
+                     "法令識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items()) + "\n質問: " + question, 900)
         ai_refs = ai.get("candidates", [])
     except Exception:
         ai_refs = []
-    words = set(re.findall(r"[一-龥ぁ-んァ-ヶ]{2,7}", question))
-    words |= {w for w in ("専決", "承認", "随意契約", "入札", "条例", "議会", "副市長", "代理", "契約") if w in question}
-    ranked = []
-    for kind, articles in corpus.items():
-        for num, art in articles.items():
-            score = sum(min(3, art["text"].count(w)) for w in words if len(w) > 1)
-            if score:
-                ranked.append((score, kind, num))
-    ranked.sort(key=lambda x: -x[0])
     refs, seen = [], set()
-    for x in explicit + ai_refs + [{"kind": k, "article": n} for _, k, n in ranked[:12]]:
+    for x in explicit + guided + ai_refs:
         if not isinstance(x, dict):
             continue
         k, n = x.get("kind"), normalize_num(x.get("article"))
@@ -203,9 +222,20 @@ kindは入力で示す識別子のみ。条番号は半角数字、枝番号は1
             continue
         seen.add((k, n))
         refs.append({"kind": k, "article": n})
-        if len(refs) >= 10:
+        if len(refs) >= 5:
             break
-    return refs, explicit
+    # 明示条文・委任先がある場合、無関係なキーワード一致条文を追加しない。
+    if refs:
+        return refs, explicit
+    words = [w for w in ("専決処分", "承認", "随意契約", "議決", "契約", "条例", "規則", "議会") if w in question]
+    ranked = []
+    for k, articles in corpus.items():
+        for n, art in articles.items():
+            score = sum(2 if w in art["text"] else 0 for w in words)
+            if score >= 4:
+                ranked.append((score, k, n))
+    ranked.sort(reverse=True)
+    return [{"kind": k, "article": n} for _, k, n in ranked[:3]], explicit
 
 
 def local_checks(refs, corpus, names):
@@ -228,7 +258,6 @@ def local_checks(refs, corpus, names):
                                        "type": name, "excerpt": body[:230]})
     return checks
 
-
 def national_mentions(refs, corpus, names):
     results = set()
     for ref in refs:
@@ -240,7 +269,7 @@ def national_mentions(refs, corpus, names):
     return sorted(results)[:12]
 
 
-def generate_answer(question, refs, corpus, names, client, model, explicit):
+def generate_answer(question, refs, corpus, names, client, model, explicit, annex_texts, missing_annexes):
     evidence = []
     for ref in refs[:7]:
         k, n = ref["kind"], ref["article"]
@@ -256,7 +285,9 @@ def generate_answer(question, refs, corpus, names, client, model, explicit):
 JSONのみで回答する。形式:
 {"conclusion":"...","explanation":"...","conditions":["..."],"cautions":["..."],"citations":[{"kind":"令","article":"167_2","paragraph":"1","item":"5"}]}"""
     prompt = "識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items())
-    prompt += "\n質問: " + question + "\n\n確認済み条文:\n" + "\n\n".join(evidence)[:36000]
+    prompt += "\n質問: " + question + "\n\n確認済み条文:\n" + "\n\n".join(evidence)[:30000]
+    prompt += "\n\n取得できた別表原文:\n" + "\n".join(f"{title}\n{text[:10000]}" for title, text in annex_texts)
+    prompt += "\n未取得の別表: " + ("、".join(missing_annexes) or "なし")
     answer = ai_json(client, model, system, prompt, 2600)
     if not isinstance(answer, dict):
         raise ValueError("回答の形式が不正です")
@@ -330,7 +361,9 @@ if run:
         names["追加"] = (other_name.strip(), other_id.strip().upper())
     try:
         with st.spinner("e-Govから法令原文を取得しています..."):
-            corpus = {k: fetch_law(law_id) for k, (_, law_id) in names.items()}
+            raw_laws = {k: fetch_law(law_id) for k, (_, law_id) in names.items()}
+            corpus = {k: v["articles"] for k, v in raw_laws.items()}
+            annexes = {k: v["annexes"] for k, v in raw_laws.items()}
         client = client_for_gemini()
         with st.spinner("根拠条文を検索しています..."):
             refs, explicit = find_candidates(question, corpus, names, client, model)
@@ -338,7 +371,8 @@ if run:
             st.warning("根拠条文を特定できませんでした。改正履歴など、条文検索以外の質問には対応できない場合があります。")
             st.stop()
         with st.spinner("根拠条文から回答を作成しています..."):
-            answer, errors = generate_answer(question, refs, corpus, names, client, model, explicit)
+            annex_texts, missing_annexes = related_annexes(question, refs, annexes)
+            answer, errors = generate_answer(question, refs, corpus, names, client, model, explicit, annex_texts, missing_annexes)
 
         # 重要な確認事項は回答より前に、大きく・明確に表示する。
         # 回答の根拠として引用された項・号に絞り、別の論点の警告を混ぜにくくする。
@@ -395,7 +429,7 @@ if run:
             answer_lines.append("【検証で問題を検出：AIの解釈文は非表示】")
             for e in errors:
                 st.write("・" + e)
-                answer_lines.append("・" + e)
+                answer_lines.extend(["・" + e])
         else:
             for title, key in (("結論", "conclusion"), ("説明", "explanation")):
                 value = str(answer.get(key, ""))
@@ -426,7 +460,7 @@ if run:
 
         # 引用された条文を最優先に表示する。AI回答が抑止されても原文は表示する。
         st.subheader("e-Govから取得した根拠条文原文")
-        st.caption("AIの言い換えではなくe-Gov XML由来の本文です。附則や別表はこの版では対象外です。")
+        st.caption("AIの言い換えではなくe-Gov XML由来の本文です。附則は対象外です。")
         priority = []
         for c in answer["citations"]:
             key = (c["kind"], c["article"])
@@ -449,6 +483,16 @@ if run:
             with st.expander(heading, expanded=(index == 0 or (citation is not None and index < 3))):
                 st.text(render_article(names[k][0], n, corpus[k][n]))
                 st.link_button("e-Govで法令を確認", f"https://laws.e-gov.go.jp/law/{names[k][1]}")
+
+        st.subheader("関連する別表の原文")
+        if annex_texts:
+            for title, body in annex_texts:
+                st.markdown(f"**{title}**")
+                st.code(body, language=None)
+        if missing_annexes:
+            st.warning("別表原文を取得できませんでした：" + "、".join(missing_annexes) + "。金額を推測しないでください。")
+        if not annex_texts and not missing_annexes:
+            st.caption("今回の質問では対象となる別表を特定していません。")
 
         st.subheader("他の国の法令への引用候補")
         mentions = national_mentions(refs[:7], corpus, names)
