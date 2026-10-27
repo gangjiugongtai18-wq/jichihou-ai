@@ -1,4 +1,60 @@
 
+import datetime as dt
+import json
+import re
+import xml.etree.ElementTree as ET
+
+import requests
+import streamlit as st
+from openai import OpenAI
+
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.3", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.3")
+st.caption("e-Govの法令原文を確認し、自治体の条例・規則等で別途確認すべき事項を表示します。")
+
+LAWS = {
+    "法": ("地方自治法", "322AC0000000067"),
+    "令": ("地方自治法施行令", "322CO0000000016"),
+    "規則": ("地方自治法施行規則", "322M40000008029"),
+}
+API1 = "https://laws.e-gov.go.jp/api/1/lawdata/"
+API2 = "https://laws.e-gov.go.jp/api/2/law_revisions/"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+LOCAL_PATTERNS = [
+    (r"(?:普通地方公共団体|地方公共団体|当該団体|当該普通地方公共団体)?の?条例(?:で|により|の定めるところ)", "条例"),
+    (r"(?:普通地方公共団体|地方公共団体|当該団体|当該普通地方公共団体)の規則(?:で|により|の定めるところ)", "自治体の規則"),
+    (r"(?:議会の)?会議規則(?:で|により|の定めるところ)", "議会の会議規則"),
+    (r"(?:普通地方公共団体の)?長が(?:別に)?定める", "長が定める規程等"),
+    (r"(?:条例|規則)の定めるところ", "条例・規則"),
+]
+# 「規則で定める」だけでは国の省令を指す場合もあるため、自治体の規則と即断しない。
+AMBIGUOUS_PATTERN = r"(?<!省令)(?<!総務省令)規則で定める"
+NATIONAL_REF_PATTERN = re.compile(r"([一-龥ぁ-んァ-ヶ・]{2,55}(?:法律|法|政令|省令|施行令|施行規則))第[一二三四五六七八九十百千〇零０-９0-9の]+条")
+
+
+def normalize_num(value):
+    s = str(value or "").translate(DIGITS).strip().replace("第", "").replace("条", "")
+    s = s.replace("の", "_").replace("-", "_")
+    return s if re.fullmatch(r"\d+(?:_\d+)*", s) else ""
+
+
+def article_label(num):
+    parts = num.split("_")
+    return "第" + parts[0] + "条" + "".join("の" + x for x in parts[1:])
+
+
+def node_text(node):
+    return "".join(node.itertext()).strip() if node is not None else ""
+
+
+def parse_article(article):
+    paragraphs = []
+    for p in article.findall("./Paragraph"):
+        pnum = str(p.get("Num") or len(paragraphs) + 1)
+        sentence = node_text(p.find("./ParagraphSentence"))
+        items = []
+        for item in p.findall("./Item"):
             item_num = str(item.get("Num") or "").translate(DIGITS)
             item_num = item_num.replace("第", "").replace("号", "")
             # 号の内部の細目も、少なくとも本文として保存する。
@@ -273,14 +329,6 @@ if run:
         if not refs:
             st.warning("根拠条文を特定できませんでした。改正履歴など、条文検索以外の質問には対応できない場合があります。")
             st.stop()
-        st.subheader("条文検索結果")
-        search_text = "\\n".join(
-            f"・{names[r['kind']][0]} {article_label(r['article'])}"
-            for r in refs[:7]
-        )
-        st.write(search_text)
-        st.code(search_text, language=None)
-        st.caption("上の枠のコピーアイコンで条文検索結果をコピーできます。")
         with st.spinner("根拠条文から回答を作成しています..."):
             answer, errors = generate_answer(question, refs, corpus, names, client, model, explicit)
 
@@ -308,6 +356,29 @@ if run:
             st.caption("このアプリは各自治体の条例・規則等を取得・検証していません。")
         elif all_checks:
             st.warning("⚠️【自治体例規の確認】検索候補の条文に条例・規則等への委任表現があります。今回の回答との関係は未確定です。下の詳細を確認してください。")
+
+        st.subheader("自治体の条例・規則等の確認")
+        checks = cited_checks if cited_checks else all_checks
+        if checks:
+            st.warning("⚠️ 自治体の現行の条例・規則等を確認してください。上部の重要警告は、回答に引用された条項を優先しています。")
+            st.caption("このアプリは自治体例規を自動取得・検証しません。以下は機械的な候補抽出であり、網羅性や委任関係の確定を保証しません。")
+            for c in checks[:15]:
+                st.write(f"・**{c['source']}**：{c['type']}の確認が必要")
+                with st.expander("検出した条文の記載を確認"):
+                    st.text(c["excerpt"])
+        else:
+            st.info("検索した条文から自治体例規への明示的な委任表現は検出されませんでした。ただし、自治体例規の確認が不要と確定したわけではありません。")
+        st.caption("金額、要件、手続など自治体固有の事項は、当該自治体の担当部署や公式例規集で確認してください。")
+
+
+        st.subheader("条文検索結果")
+        search_text = "\n".join(
+            f"・{names[r['kind']][0]} {article_label(r['article'])}"
+            for r in refs[:7]
+        )
+        st.write(search_text)
+        st.code(search_text, language=None)
+        st.caption("上の枠のコピーアイコンで条文検索結果をコピーできます。")
 
         st.subheader("AIの回答")
         answer_lines = []
@@ -340,7 +411,7 @@ if run:
                 citation_line = f"・{names[c['kind']][0]} {article_label(c['article'])}{suffix}"
                 st.write(citation_line)
                 answer_lines.append(citation_line)
-        answer_copy = "\\n".join(answer_lines).strip()
+        answer_copy = "\n".join(answer_lines).strip()
         st.markdown("**AIの回答をコピー**")
         st.code(answer_copy, language=None)
         st.caption("上の枠のコピーアイコンでAIの回答をまとめてコピーできます。")
@@ -362,7 +433,7 @@ if run:
             for k, n in priority
         ]
         st.markdown("**根拠条文原文をまとめてコピー**")
-        st.code("\\n\\n".join(original_texts), language=None)
+        st.code("\n\n".join(original_texts), language=None)
         st.caption("上の枠のコピーアイコンで表示対象の条文原文を一括コピーできます。")
         for index, (k, n) in enumerate(priority):
             citation = next((c for c in answer["citations"] if c["kind"] == k and c["article"] == n), None)
@@ -370,19 +441,6 @@ if run:
             with st.expander(heading, expanded=(index == 0 or (citation is not None and index < 3))):
                 st.text(render_article(names[k][0], n, corpus[k][n]))
                 st.link_button("e-Govで法令を確認", f"https://laws.e-gov.go.jp/law/{names[k][1]}")
-
-        st.subheader("自治体の条例・規則等の確認")
-        checks = cited_checks if cited_checks else all_checks
-        if checks:
-            st.warning("⚠️ 自治体の現行の条例・規則等を確認してください。上部の重要警告は、回答に引用された条項を優先しています。")
-            st.caption("このアプリは自治体例規を自動取得・検証しません。以下は機械的な候補抽出であり、網羅性や委任関係の確定を保証しません。")
-            for c in checks[:15]:
-                st.write(f"・**{c['source']}**：{c['type']}の確認が必要")
-                with st.expander("検出した条文の記載を確認"):
-                    st.text(c["excerpt"])
-        else:
-            st.info("検索した条文から自治体例規への明示的な委任表現は検出されませんでした。ただし、自治体例規の確認が不要と確定したわけではありません。")
-        st.caption("金額、要件、手続など自治体固有の事項は、当該自治体の担当部署や公式例規集で確認してください。")
 
         st.subheader("他の国の法令への引用候補")
         mentions = national_mentions(refs[:7], corpus, names)
