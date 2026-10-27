@@ -1,4 +1,3 @@
-
 import datetime as dt
 import json
 import re
@@ -8,8 +7,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.4")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4.1", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.4.1")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -258,6 +257,7 @@ def local_checks(refs, corpus, names):
                                        "type": name, "excerpt": body[:230]})
     return checks
 
+
 def national_mentions(refs, corpus, names):
     results = set()
     for ref in refs:
@@ -414,13 +414,12 @@ if run:
 
 
         st.subheader("条文検索結果")
-        search_text = "\n".join(
+        search_text = "【条文検索結果】\n" + "\n".join(
             f"・{names[r['kind']][0]} {article_label(r['article'])}"
             for r in refs[:7]
         )
-        st.write(search_text)
         st.code(search_text, language=None)
-        st.caption("上の枠のコピーアイコンで条文検索結果をコピーできます。")
+        st.caption("上の枠のコピーアイコンで、表題を含む条文検索結果を一括コピーできます。")
 
         st.subheader("AIの回答")
         answer_lines = []
@@ -429,7 +428,7 @@ if run:
             answer_lines.append("【検証で問題を検出：AIの解釈文は非表示】")
             for e in errors:
                 st.write("・" + e)
-                answer_lines.extend(["・" + e])
+                answer_lines.append("・" + e)
         else:
             for title, key in (("結論", "conclusion"), ("説明", "explanation")):
                 value = str(answer.get(key, ""))
