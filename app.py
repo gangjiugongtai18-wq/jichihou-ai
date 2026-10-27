@@ -8,9 +8,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.3", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.3")
-st.caption("e-Govの法令原文を確認し、自治体の条例・規則等で別途確認すべき事項を表示します。")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.3.1", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.3.1")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -303,9 +302,18 @@ with st.sidebar:
         st.caption("法令名だけで自動特定はしません。正しい法令IDをe-Govで確認して入力してください。")
     model = st.text_input("Geminiモデル", value=DEFAULT_MODEL)
 
+def clear_question():
+    st.session_state["question_input"] = ""
+
+
 question = st.text_area("地方自治法等について質問してください", height=110,
-                        placeholder="例：少額随意契約の金額基準は自治体の規則で定めますか？")
-run = st.button("条文を検索して回答", type="primary", disabled=not chosen and not other_id.strip())
+                        placeholder="例：少額随意契約の金額基準は自治体の規則で定めますか？",
+                        key="question_input")
+search_col, clear_col = st.columns(2)
+with search_col:
+    run = st.button("条文を検索して回答", type="primary", disabled=not chosen and not other_id.strip(), use_container_width=True)
+with clear_col:
+    st.button("🗑️ 質問をクリア", on_click=clear_question, use_container_width=True)
 
 if run:
     if not question.strip():
