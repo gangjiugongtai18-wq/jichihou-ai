@@ -7,8 +7,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.5.0", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.5.0")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.5.1", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.5.1")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -80,22 +80,39 @@ def render_article(name, num, art, paragraph=None, item=None):
 
 
 def format_annex(node):
-    """e-Gov別表XMLの表セルを行単位に整理する。値や単位は変更しない。"""
+    """別表のセル構造を保持して表示。第三・第五の結合セルと単位を補う。"""
     title = re.sub(r"\s+", "", node_text(node.find("./AppdxTableTitle")))
     related = re.sub(r"\s+", "", node_text(node.find("./RelatedArticleNum")))
-    lines = [title + ("（" + related + "）" if related and related not in title else "")]
+    heading = title + ("（" + related.strip("（）") + "）" if related and related.strip("（）") not in title else "")
+    rows = []
     for table in node.findall(".//Table"):
         for tr in table.findall("./TableRow"):
-            cells = []
-            for cell in tr.findall("./TableColumn"):
-                value = re.sub(r"[\s\u3000]+", "", node_text(cell))
-                if value:
-                    cells.append(value)
-            if cells:
-                lines.append(" | ".join(cells))
-    if len(lines) == 1:
-        # 表の構造が想定外でも原文の文字列を捨てない。
+            cells = [re.sub(r"[\s\u3000]+", "", node_text(c)) for c in tr.findall("./TableColumn")]
+            if any(cells):
+                rows.append(cells)
+    if not rows:
         return re.sub(r"[ \t\u3000]+", " ", node_text(node)).strip()
+    if "別表第三" in title:
+        lines = [heading, "契約の種類 | 自治体区分 | 予定価格の基準額（単位：千円）"]
+        contract = ""
+        for cells in rows:
+            vals = [c for c in cells if c]
+            if not vals:
+                continue
+            if "工事又は製造の請負" in vals[0]:
+                contract = vals[0]
+                vals = vals[1:]
+            if len(vals) >= 2:
+                group = vals[0]
+                amount = vals[-1].removeprefix("千円")
+                lines.append(f"{contract} | {group} | {amount}千円")
+            else:
+                lines.append(" | ".join(vals))
+        return "\n".join(lines)
+    lines = [heading]
+    for cells in rows:
+        vals = [c for c in cells if c]
+        lines.append(" | ".join(vals))
     return "\n".join(lines)
 
 
@@ -244,7 +261,9 @@ def find_candidates(question, corpus, names, client, model):
     except Exception:
         ai_refs = []
     refs, seen = [], set()
-    for x in explicit + guided + ai_refs:
+    # 明示条文や既知の委任先が見つかった場合、AIの推測候補を混入させない。
+    # 質問に明示された条文を必ず優先する。
+    for x in explicit + guided + ([] if explicit or guided else ai_refs):
         if not isinstance(x, dict):
             continue
         k, n = x.get("kind"), normalize_num(x.get("article"))
@@ -313,7 +332,7 @@ def generate_answer(question, refs, corpus, names, client, model, explicit, anne
 引用先の他の国の法律・政令・省令の本文が提示されていなければ、その内容を確認済みとしない。
 未施行改正・判例・通知・自治体例規を推測で補わない。
 引用は提示した法令識別子・条番号に限定し、実際に根拠として使った条文だけを挙げる。
-JSONのみで回答する。形式:
+金額の単位（円・千円・万円）を省略せず、原文の単位を確認する。\nJSONのみで回答する。形式:
 {"conclusion":"...","explanation":"...","conditions":["..."],"cautions":["..."],"citations":[{"kind":"令","article":"167_2","paragraph":"1","item":"5"}]}"""
     prompt = "識別子: " + ", ".join(f"{k}={v[0]}" for k, v in names.items())
     prompt += "\n質問: " + question + "\n\n確認済み条文:\n" + "\n\n".join(evidence)[:30000]
