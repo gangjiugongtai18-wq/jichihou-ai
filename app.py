@@ -7,8 +7,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4.1", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.4.1")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4.2", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.4.2")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -199,6 +199,17 @@ def find_candidates(question, corpus, names, client, model):
     explicit = explicit_refs(question, names)
     # 既知の委任関係を優先。対象条文が実際に取得できた場合のみ候補にする。
     guided = []
+    # 条例と規則の違いを尋ねる場合は基本条文を優先する。
+    if (
+        "条例" in question
+        and "規則" in question
+        and any(word in question for word in ("違い", "相違", "区別", "制定"))
+    ):
+        guided += [
+            {"kind": "法", "article": "14"},
+            {"kind": "法", "article": "15"},
+            {"kind": "法", "article": "96"},
+        ]
     if "随意契約" in question or "167条の2" in question.translate(DIGITS):
         guided += [{"kind": "法", "article": "234"}, {"kind": "令", "article": "167_2"}]
     if ("議決" in question and "契約" in question) or "96条" in question.translate(DIGITS):
@@ -452,7 +463,7 @@ if run:
                 citation_line = f"・{names[c['kind']][0]} {article_label(c['article'])}{suffix}"
                 st.write(citation_line)
                 answer_lines.append(citation_line)
-        answer_copy = "\n".join(answer_lines).strip()
+        answer_copy = "【AIの回答】\n" + "\n".join(answer_lines).strip()
         st.markdown("**AIの回答をコピー**")
         st.code(answer_copy, language=None)
         st.caption("上の枠のコピーアイコンでAIの回答をまとめてコピーできます。")
@@ -474,7 +485,7 @@ if run:
             for k, n in priority
         ]
         st.markdown("**根拠条文原文をまとめてコピー**")
-        st.code("\n\n".join(original_texts), language=None)
+        st.code("【e-Govから取得した根拠条文原文】\n\n" + "\n\n".join(original_texts), language=None)
         st.caption("上の枠のコピーアイコンで表示対象の条文原文を一括コピーできます。")
         for index, (k, n) in enumerate(priority):
             citation = next((c for c in answer["citations"] if c["kind"] == k and c["article"] == n), None)
