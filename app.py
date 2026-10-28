@@ -7,8 +7,8 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="⚖️ 自治法AI Ver.7.4.2", page_icon="⚖️", layout="wide")
-st.title("⚖️ 自治法AI Ver.7.4.2")
+st.set_page_config(page_title="⚖️ 自治法AI Ver.7.5.0", page_icon="⚖️", layout="wide")
+st.title("⚖️ 自治法AI Ver.7.5.0")
 
 LAWS = {
     "法": ("地方自治法", "322AC0000000067"),
@@ -79,6 +79,26 @@ def render_article(name, num, art, paragraph=None, item=None):
     return "\n".join(lines)
 
 
+def format_annex(node):
+    """e-Gov別表XMLの表セルを行単位に整理する。値や単位は変更しない。"""
+    title = re.sub(r"\s+", "", node_text(node.find("./AppdxTableTitle")))
+    related = re.sub(r"\s+", "", node_text(node.find("./RelatedArticleNum")))
+    lines = [title + ("（" + related + "）" if related and related not in title else "")]
+    for table in node.findall(".//Table"):
+        for tr in table.findall("./TableRow"):
+            cells = []
+            for cell in tr.findall("./TableColumn"):
+                value = re.sub(r"[\s\u3000]+", "", node_text(cell))
+                if value:
+                    cells.append(value)
+            if cells:
+                lines.append(" | ".join(cells))
+    if len(lines) == 1:
+        # 表の構造が想定外でも原文の文字列を捨てない。
+        return re.sub(r"[ \t\u3000]+", " ", node_text(node)).strip()
+    return "\n".join(lines)
+
+
 @st.cache_data(ttl=43200, show_spinner=False)
 def fetch_law(law_id):
     res = requests.get(API1 + law_id, timeout=55)
@@ -104,7 +124,7 @@ def fetch_law(law_id):
     if body is not None:
         for node in body.findall("./AppdxTable"):
             title = node_text(node.find("./AppdxTableTitle"))
-            text = node_text(node)
+            text = format_annex(node)
             if title and text:
                 annexes[title] = text
     return {"articles": articles, "annexes": annexes}
@@ -498,7 +518,7 @@ if run:
         if annex_texts:
             for title, body in annex_texts:
                 st.markdown(f"**{title}**")
-                st.code(body, language=None)
+                st.code("【" + title + "】\n" + body, language=None)
         if missing_annexes:
             st.warning("別表原文を取得できませんでした：" + "、".join(missing_annexes) + "。金額を推測しないでください。")
         if not annex_texts and not missing_annexes:
